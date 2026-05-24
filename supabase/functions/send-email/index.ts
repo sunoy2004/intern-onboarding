@@ -1,5 +1,6 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2";
+import nodemailer from "npm:nodemailer";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -19,7 +20,7 @@ interface SendEmailParams {
 
 async function sendViaResend(
   apiKey: string,
-  params: { from: string; to: string[]; subject: string; html: string }
+  params: { from: string; to: string[]; subject: string; html: string; attachments?: any[] }
 ) {
   const response = await fetch(RESEND_API_URL, {
     method: "POST",
@@ -30,6 +31,52 @@ async function sendViaResend(
     body: JSON.stringify(params),
   });
   return response;
+}
+
+async function sendViaSMTP(params: {
+  from?: string;
+  to: string[];
+  subject: string;
+  html: string;
+  attachments?: any[];
+}) {
+  const host = Deno.env.get("SMTP_HOST");
+  const port = parseInt(Deno.env.get("SMTP_PORT") || "587");
+  const user = Deno.env.get("SMTP_USER");
+  const pass = Deno.env.get("SMTP_PASS");
+  const secure = Deno.env.get("SMTP_SECURE") === "true";
+  const defaultFrom = Deno.env.get("SMTP_FROM") || Deno.env.get("RESEND_FROM_EMAIL") || "onboarding@resend.dev";
+
+  if (!host || !user || !pass) {
+    throw new Error("SMTP credentials are not fully configured (SMTP_HOST, SMTP_USER, SMTP_PASS are required)");
+  }
+
+  const transporter = nodemailer.createTransport({
+    host,
+    port,
+    secure,
+    auth: {
+      user,
+      pass,
+    },
+  });
+
+  const mailOptions = {
+    from: params.from || defaultFrom,
+    to: params.to.join(", "),
+    subject: params.subject,
+    html: params.html,
+    attachments: params.attachments,
+  };
+
+  return await transporter.sendMail(mailOptions);
+}
+
+async function fetchFileAsUint8Array(url: string): Promise<Uint8Array> {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Failed to fetch file from URL: ${url}`);
+  const arrayBuffer = await res.arrayBuffer();
+  return new Uint8Array(arrayBuffer);
 }
 
 function generatePassword(length = 12): string {
@@ -46,7 +93,8 @@ function buildOnboardingEmailHtml(
   email: string,
   password: string,
   loginUrl: string,
-  department: string
+  department: string,
+  offerLetterUrl?: string | null
 ): string {
   return `
     <div style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; max-width: 600px; margin: 0 auto; background: #ffffff; border-radius: 12px; overflow: hidden; border: 1px solid #e5e7eb;">
@@ -59,6 +107,25 @@ function buildOnboardingEmailHtml(
         <p style="font-size: 15px; color: #475569; margin: 0 0 24px; line-height: 1.6;">
           We're excited to have you join the <strong>${department}</strong> team! Your onboarding process has been initiated. Below are your login credentials to access the intern portal where you can complete your documentation.
         </p>
+        
+        ${
+          offerLetterUrl
+            ? `
+            <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 16px; margin: 0 0 24px;">
+              <div style="display: flex; align-items: center; justify-content: space-between;">
+                <div>
+                  <p style="margin: 0; font-size: 14px; font-weight: 600; color: #0f172a;">Official Offer Letter</p>
+                  <p style="margin: 4px 0 0; font-size: 12px; color: #64748b;">This document is attached to this email and available for download.</p>
+                </div>
+                <a href="${offerLetterUrl}" style="display: inline-block; background: #ffffff; border: 1px solid #cbd5e1; color: #0f172a; padding: 8px 16px; border-radius: 6px; text-decoration: none; font-weight: 500; font-size: 13px; margin-left: 12px; white-space: nowrap;">
+                  Download PDF
+                </a>
+              </div>
+            </div>
+            `
+            : ""
+        }
+
         <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 24px; margin: 0 0 24px;">
           <p style="margin: 0 0 12px; font-size: 13px; color: #64748b; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600;">Login Credentials</p>
           <table style="width: 100%; border-collapse: collapse;">
@@ -206,43 +273,51 @@ Deno.serve(async (req: Request) => {
       const emailSubject = `Welcome to MAQ Software - Your Onboarding Credentials`;
 
       let attachments = undefined;
-      // Temporary bypass: do not fetch and attach the offer letter PDF to the email for testing
-      /*
-      if (intern.offer_letter_url) {
-        try {
-          console.log(`Downloading offer letter from: ${intern.offer_letter_url}`);
-          const base64Content = await fetchFileAsBase64(intern.offer_letter_url);
-          attachments = [
-            {
-              content: base64Content,
+      const isSmtpConfigured = !!Deno.env.get("SMTP_HOST");
+
+      if (isSmtpConfigured) {
+        const smtpAttachments = [];
+        if (intern.offer_letter_url) {
+          try {
+            console.log(`SMTP: Fetching offer letter from: ${intern.offer_letter_url}`);
+            const fileContent = await fetchFileAsUint8Array(intern.offer_letter_url);
+            smtpAttachments.push({
               filename: "Offer_Letter.pdf",
-            },
-          ];
-          console.log("Successfully prepared offer letter attachment");
-        } catch (err) {
-          console.error("Failed to attach offer letter:", err);
-          await supabase.from("agent_logs").insert({
-            intern_id: intern.id,
-            action: "offer_letter_attachment_failed",
-            details: { error: String(err), offer_letter_url: intern.offer_letter_url },
-            status: "warning",
-          });
+              content: fileContent,
+            });
+            console.log("SMTP: Successfully prepared offer letter attachment");
+          } catch (err) {
+            console.error("SMTP: Failed to attach offer letter:", err);
+            await supabase.from("agent_logs").insert({
+              intern_id: intern.id,
+              action: "offer_letter_attachment_failed",
+              details: { error: String(err), offer_letter_url: intern.offer_letter_url },
+              status: "warning",
+            });
+          }
         }
-      }
-      */
 
-      if (resendApiKey) {
-        const response = await sendViaResend(resendApiKey, {
-          from: `MAQ Onboarding <${fromEmail}>`,
-          to: [intern.email],
-          subject: emailSubject,
-          html: emailHtml,
-          attachments,
-        });
+        try {
+          console.log(`SMTP: Sending invite email to ${intern.email}`);
+          const fromName = Deno.env.get("SMTP_FROM") || `MAQ Onboarding <${fromEmail}>`;
+          const info = await sendViaSMTP({
+            from: fromName,
+            to: [intern.email],
+            subject: emailSubject,
+            html: emailHtml,
+            attachments: smtpAttachments,
+          });
 
-        const resendData = await response.json();
-
-        if (!response.ok) {
+          await supabase.from("email_logs").insert({
+            intern_id,
+            email_type: "onboarding_invite",
+            recipient_email: intern.email,
+            subject: emailSubject,
+            status: "sent",
+            resent_id: info.messageId || "smtp",
+          });
+        } catch (smtpErr) {
+          console.error("SMTP Error:", smtpErr);
           await supabase.from("email_logs").insert({
             intern_id,
             email_type: "onboarding_invite",
@@ -254,32 +329,94 @@ Deno.serve(async (req: Request) => {
           await supabase.from("agent_logs").insert({
             intern_id,
             action: "email_send_failed",
-            details: { error: resendData, email_type: "onboarding_invite" },
+            details: { error: String(smtpErr), email_type: "onboarding_invite" },
             status: "failure",
           });
 
           return new Response(
-            JSON.stringify({ error: "Failed to send email", details: resendData }),
+            JSON.stringify({ error: "Failed to send SMTP email", details: String(smtpErr) }),
             { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
           );
         }
-
-        await supabase.from("email_logs").insert({
-          intern_id,
-          email_type: "onboarding_invite",
-          recipient_email: intern.email,
-          subject: emailSubject,
-          status: "sent",
-          resent_id: resendData.id,
-        });
       } else {
-        await supabase.from("email_logs").insert({
-          intern_id,
-          email_type: "onboarding_invite",
-          recipient_email: intern.email,
-          subject: emailSubject,
-          status: "sent",
-        });
+        // Fallback to Resend API
+        if (intern.offer_letter_url) {
+          try {
+            console.log(`Resend: Fetching offer letter from: ${intern.offer_letter_url}`);
+            const fileContent = await fetchFileAsUint8Array(intern.offer_letter_url);
+            let binary = "";
+            for (let i = 0; i < fileContent.byteLength; i++) {
+              binary += String.fromCharCode(fileContent[i]);
+            }
+            const base64Content = btoa(binary);
+            attachments = [
+              {
+                content: base64Content,
+                filename: "Offer_Letter.pdf",
+              },
+            ];
+            console.log("Resend: Successfully prepared offer letter attachment");
+          } catch (err) {
+            console.error("Resend: Failed to attach offer letter:", err);
+            await supabase.from("agent_logs").insert({
+              intern_id: intern.id,
+              action: "offer_letter_attachment_failed",
+              details: { error: String(err), offer_letter_url: intern.offer_letter_url },
+              status: "warning",
+            });
+          }
+        }
+
+        if (resendApiKey) {
+          const response = await sendViaResend(resendApiKey, {
+            from: `MAQ Onboarding <${fromEmail}>`,
+            to: [intern.email],
+            subject: emailSubject,
+            html: emailHtml,
+            attachments,
+          });
+
+          const resendData = await response.json();
+
+          if (!response.ok) {
+            await supabase.from("email_logs").insert({
+              intern_id,
+              email_type: "onboarding_invite",
+              recipient_email: intern.email,
+              subject: emailSubject,
+              status: "failed",
+            });
+
+            await supabase.from("agent_logs").insert({
+              intern_id,
+              action: "email_send_failed",
+              details: { error: resendData, email_type: "onboarding_invite" },
+              status: "failure",
+            });
+
+            return new Response(
+              JSON.stringify({ error: "Failed to send email", details: resendData }),
+              { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+            );
+          }
+
+          await supabase.from("email_logs").insert({
+            intern_id,
+            email_type: "onboarding_invite",
+            recipient_email: intern.email,
+            subject: emailSubject,
+            status: "sent",
+            resent_id: resendData.id,
+          });
+        } else {
+          await supabase.from("email_logs").insert({
+            intern_id,
+            email_type: "onboarding_invite",
+            recipient_email: intern.email,
+            subject: emailSubject,
+            status: "sent",
+          });
+        }
       }
 
       // Update onboarding step
@@ -342,17 +479,29 @@ Deno.serve(async (req: Request) => {
       // Send to personal email so they can still receive it
       const recipientEmail = intern.personal_email || intern.email;
 
-      if (resendApiKey) {
-        const response = await sendViaResend(resendApiKey, {
-          from: `Mac Onboarding <${fromEmail}>`,
-          to: [recipientEmail],
-          subject: emailSubject,
-          html: emailHtml,
-        });
+      const isSmtpConfigured = !!Deno.env.get("SMTP_HOST");
 
-        const resendData = await response.json();
+      if (isSmtpConfigured) {
+        try {
+          console.log(`SMTP: Sending company credentials email to ${recipientEmail}`);
+          const fromName = Deno.env.get("SMTP_FROM") || `Mac Onboarding <${fromEmail}>`;
+          const info = await sendViaSMTP({
+            from: fromName,
+            to: [recipientEmail],
+            subject: emailSubject,
+            html: emailHtml,
+          });
 
-        if (!response.ok) {
+          await supabase.from("email_logs").insert({
+            intern_id,
+            email_type: "company_credentials",
+            recipient_email: recipientEmail,
+            subject: emailSubject,
+            status: "sent",
+            resent_id: info.messageId || "smtp",
+          });
+        } catch (smtpErr) {
+          console.error("SMTP Error:", smtpErr);
           await supabase.from("email_logs").insert({
             intern_id,
             email_type: "company_credentials",
@@ -362,27 +511,53 @@ Deno.serve(async (req: Request) => {
           });
 
           return new Response(
-            JSON.stringify({ error: "Failed to send email", details: resendData }),
+            JSON.stringify({ error: "Failed to send SMTP email", details: String(smtpErr) }),
             { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
           );
         }
-
-        await supabase.from("email_logs").insert({
-          intern_id,
-          email_type: "company_credentials",
-          recipient_email: recipientEmail,
-          subject: emailSubject,
-          status: "sent",
-          resent_id: resendData.id,
-        });
       } else {
-        await supabase.from("email_logs").insert({
-          intern_id,
-          email_type: "company_credentials",
-          recipient_email: recipientEmail,
-          subject: emailSubject,
-          status: "sent",
-        });
+        if (resendApiKey) {
+          const response = await sendViaResend(resendApiKey, {
+            from: `Mac Onboarding <${fromEmail}>`,
+            to: [recipientEmail],
+            subject: emailSubject,
+            html: emailHtml,
+          });
+
+          const resendData = await response.json();
+
+          if (!response.ok) {
+            await supabase.from("email_logs").insert({
+              intern_id,
+              email_type: "company_credentials",
+              recipient_email: recipientEmail,
+              subject: emailSubject,
+              status: "failed",
+            });
+
+            return new Response(
+              JSON.stringify({ error: "Failed to send email", details: resendData }),
+              { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+            );
+          }
+
+          await supabase.from("email_logs").insert({
+            intern_id,
+            email_type: "company_credentials",
+            recipient_email: recipientEmail,
+            subject: emailSubject,
+            status: "sent",
+            resent_id: resendData.id,
+          });
+        } else {
+          await supabase.from("email_logs").insert({
+            intern_id,
+            email_type: "company_credentials",
+            recipient_email: recipientEmail,
+            subject: emailSubject,
+            status: "sent",
+          });
+        }
       }
 
       await supabase.from("agent_logs").insert({
@@ -406,37 +581,84 @@ Deno.serve(async (req: Request) => {
         );
       }
 
-      if (!resendApiKey) {
+      const isSmtpConfigured = !!Deno.env.get("SMTP_HOST");
+
+      if (isSmtpConfigured) {
+        try {
+          console.log(`SMTP: Sending custom email to ${to}`);
+          const fromName = Deno.env.get("SMTP_FROM") || `Mac Onboarding <${fromEmail}>`;
+          const info = await sendViaSMTP({
+            from: fromName,
+            to: Array.isArray(to) ? to : [to],
+            subject,
+            html,
+          });
+
+          if (intern_id) {
+            await supabase.from("email_logs").insert({
+              intern_id,
+              email_type: email_type || "custom",
+              recipient_email: Array.isArray(to) ? to.join(",") : to,
+              subject,
+              status: "sent",
+              resent_id: info.messageId || "smtp",
+            });
+          }
+
+          return new Response(
+            JSON.stringify({ success: true, data: info }),
+            { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+          );
+        } catch (smtpErr) {
+          console.error("SMTP Error:", smtpErr);
+          if (intern_id) {
+            await supabase.from("email_logs").insert({
+              intern_id,
+              email_type: email_type || "custom",
+              recipient_email: Array.isArray(to) ? to.join(",") : to,
+              subject,
+              status: "failed",
+            });
+          }
+
+          return new Response(
+            JSON.stringify({ error: "Failed to send SMTP email", details: String(smtpErr) }),
+            { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+          );
+        }
+      } else {
+        if (!resendApiKey) {
+          return new Response(
+            JSON.stringify({ error: "RESEND_API_KEY not configured" }),
+            { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+          );
+        }
+
+        const response = await sendViaResend(resendApiKey, {
+          from: `Mac Onboarding <${fromEmail}>`,
+          to: Array.isArray(to) ? to : [to],
+          subject,
+          html,
+        });
+
+        const resendData = await response.json();
+
+        if (intern_id) {
+          await supabase.from("email_logs").insert({
+            intern_id,
+            email_type: email_type || "custom",
+            recipient_email: Array.isArray(to) ? to.join(",") : to,
+            subject,
+            status: response.ok ? "sent" : "failed",
+            resent_id: resendData.id,
+          });
+        }
+
         return new Response(
-          JSON.stringify({ error: "RESEND_API_KEY not configured" }),
-          { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+          JSON.stringify({ success: response.ok, data: resendData }),
+          { status: response.ok ? 200 : 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
       }
-
-      const response = await sendViaResend(resendApiKey, {
-        from: `Mac Onboarding <${fromEmail}>`,
-        to: Array.isArray(to) ? to : [to],
-        subject,
-        html,
-      });
-
-      const resendData = await response.json();
-
-      if (intern_id) {
-        await supabase.from("email_logs").insert({
-          intern_id,
-          email_type: email_type || "custom",
-          recipient_email: Array.isArray(to) ? to.join(",") : to,
-          subject,
-          status: response.ok ? "sent" : "failed",
-          resent_id: resendData.id,
-        });
-      }
-
-      return new Response(
-        JSON.stringify({ success: response.ok, data: resendData }),
-        { status: response.ok ? 200 : 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
     }
 
     return new Response(
