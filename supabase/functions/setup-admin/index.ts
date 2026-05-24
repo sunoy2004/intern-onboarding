@@ -28,6 +28,7 @@ Deno.serve(async (req: Request) => {
     }
 
     // Create admin user
+    let userId: string;
     const { data: authData, error: authError } = await supabase.auth.admin.createUser({
       email,
       password,
@@ -39,23 +40,51 @@ Deno.serve(async (req: Request) => {
     });
 
     if (authError) {
-      return new Response(
-        JSON.stringify({ error: authError.message }),
-        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
+      if (authError.message.includes("already") || authError.status === 422) {
+        // Fetch existing user ID
+        const { data: usersData, error: listError } = await supabase.auth.admin.listUsers();
+        if (listError) {
+          return new Response(
+            JSON.stringify({ error: `User already exists but failed to list: ${listError.message}` }),
+            { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+          );
+        }
+        const existingUser = usersData.users.find((u: any) => u.email === email);
+        if (!existingUser) {
+          return new Response(
+            JSON.stringify({ error: `User already registered but not found in user list.` }),
+            { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+          );
+        }
+        userId = existingUser.id;
+      } else {
+        return new Response(
+          JSON.stringify({ error: authError.message }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+    } else {
+      userId = authData.user.id;
     }
 
     // Upsert profile as admin
-    await supabase.from("profiles").upsert({
-      id: authData.user.id,
+    const { error: profileError } = await supabase.from("profiles").upsert({
+      id: userId,
       email,
       full_name: full_name || "Admin User",
       role: "admin",
     });
 
+    if (profileError) {
+      return new Response(
+        JSON.stringify({ error: `User created/found but profile upsert failed: ${profileError.message}` }),
+        { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
     return new Response(
-      JSON.stringify({ success: true, user_id: authData.user.id }),
-      { status: 201, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      JSON.stringify({ success: true, user_id: userId, message: "Admin profile upserted successfully" }),
+      { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
     );
   } catch (err) {
     return new Response(

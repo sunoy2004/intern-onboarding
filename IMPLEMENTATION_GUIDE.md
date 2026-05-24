@@ -52,7 +52,20 @@ VITE_SUPABASE_ANON_KEY=your-anon-key
 
 These are configured in your Supabase project dashboard under **Edge Functions > Secrets**.
 
-#### Required for Email Sending
+#### Required for Email Sending (Choose SMTP or Resend)
+
+**Option 1: Standard SMTP Server (Gmail, SendGrid, AWS SES, or custom SMTP)**
+
+| Secret | Description | Example |
+|--------|-------------|---------|
+| `SMTP_HOST` | Host address of SMTP relay server | `smtp.gmail.com` or `smtp.mailgun.org` |
+| `SMTP_PORT` | Port of SMTP service (STARTTLS / SSL) | `587` or `465` |
+| `SMTP_USER` | SMTP username for authentication | `user@gmail.com` |
+| `SMTP_PASS` | SMTP password or app-specific password | `xxxx xxxx xxxx xxxx` |
+| `SMTP_FROM` | Envelope display sender address | `onboarding@yourcompany.com` |
+| `PORTAL_URL` | URL where interns access the portal | `https://your-app.vercel.app/portal` |
+
+**Option 2: Resend API Integration**
 
 | Secret | Description | How to Get |
 |--------|-------------|------------|
