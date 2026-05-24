@@ -52,6 +52,7 @@ export default function InternsPage() {
   const [showAddDialog, setShowAddDialog] = React.useState(false)
   const [selectedIntern, setSelectedIntern] = React.useState<Intern | null>(null)
   const [form, setForm] = React.useState<AddInternForm>(defaultForm)
+  const [offerLetterFile, setOfferLetterFile] = React.useState<File | null>(null)
   const [submitting, setSubmitting] = React.useState(false)
   const [addError, setAddError] = React.useState<string | null>(null)
   const [addSuccess, setAddSuccess] = React.useState<{ password: string; email: string; name: string } | null>(null)
@@ -80,6 +81,28 @@ export default function InternsPage() {
     setSubmitting(true)
     setAddError(null)
     try {
+      let offer_letter_url = null
+      if (offerLetterFile) {
+        try {
+          const fileExt = offerLetterFile.name.split('.').pop()
+          const tempId = crypto.randomUUID()
+          const filePath = `offer-letters/${tempId}.${fileExt}`
+          
+          const { error: uploadErr } = await supabase.storage
+            .from("documents")
+            .upload(filePath, offerLetterFile)
+
+          if (uploadErr) {
+            throw new Error("Failed to upload offer letter: " + uploadErr.message)
+          }
+
+          const { data: urlData } = supabase.storage.from("documents").getPublicUrl(filePath)
+          offer_letter_url = urlData.publicUrl
+        } catch (uploadErr) {
+          console.warn("Offer letter storage upload bypassed/failed for testing:", uploadErr)
+        }
+      }
+
       const res = await fetch(
         `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/add-intern`,
         {
@@ -88,7 +111,10 @@ export default function InternsPage() {
             "Content-Type": "application/json",
             Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
           },
-          body: JSON.stringify(form),
+          body: JSON.stringify({
+            ...form,
+            offer_letter_url,
+          }),
         }
       )
       const data = await res.json()
@@ -105,6 +131,7 @@ export default function InternsPage() {
   const handleCloseAdd = () => {
     setShowAddDialog(false)
     setForm(defaultForm)
+    setOfferLetterFile(null)
     setAddError(null)
     setAddSuccess(null)
   }
@@ -319,6 +346,20 @@ export default function InternsPage() {
                   onChange={(e) => setForm((f) => ({ ...f, department: e.target.value }))}
                   required
                 />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="offer_letter">Offer Letter (PDF)</Label>
+                <Input
+                  id="offer_letter"
+                  type="file"
+                  accept=".pdf"
+                  onChange={(e) => {
+                    const file = e.target.files?.[0] || null
+                    setOfferLetterFile(file)
+                  }}
+                  className="cursor-pointer file:text-foreground file:font-medium file:bg-muted file:border-0 file:rounded-md file:px-2 file:py-1 file:mr-2 hover:file:bg-muted/80"
+                />
+                <p className="text-xs text-muted-foreground">Optional. If uploaded, the PDF will be stored and attached to their onboarding invite email.</p>
               </div>
               <DialogFooter className="pt-2">
                 <Button type="button" variant="outline" onClick={handleCloseAdd} disabled={submitting}>

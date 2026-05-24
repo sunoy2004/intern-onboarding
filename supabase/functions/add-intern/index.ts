@@ -28,7 +28,7 @@ Deno.serve(async (req: Request) => {
     );
 
     const body = await req.json();
-    const { full_name, email, department } = body;
+    const { full_name, email, department, offer_letter_url } = body;
 
     if (!full_name || !email) {
       return new Response(
@@ -81,6 +81,7 @@ Deno.serve(async (req: Request) => {
         onboarding_status: "invited",
         is_first_login: true,
         password_changed: false,
+        offer_letter_url: offer_letter_url || null,
       })
       .select()
       .single();

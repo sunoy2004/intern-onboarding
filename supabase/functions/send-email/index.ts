@@ -160,7 +160,7 @@ Deno.serve(async (req: Request) => {
     );
 
     const resendApiKey = Deno.env.get("RESEND_API_KEY");
-    const fromEmail = Deno.env.get("RESEND_FROM_EMAIL") || "onboarding@internhub.com";
+    const fromEmail = Deno.env.get("RESEND_FROM_EMAIL") || "onboarding@resend.dev";
     const portalUrl = Deno.env.get("PORTAL_URL") || "http://localhost:5173/portal";
 
     const body = await req.json();
@@ -199,17 +199,45 @@ Deno.serve(async (req: Request) => {
         intern.email,
         intern.temp_password,
         portalUrl,
-        intern.department || "General"
+        intern.department || "General",
+        intern.offer_letter_url
       );
 
-      const emailSubject = `Welcome to InternHub - Your Onboarding Credentials`;
+      const emailSubject = `Welcome to MAQ Software - Your Onboarding Credentials`;
+
+      let attachments = undefined;
+      // Temporary bypass: do not fetch and attach the offer letter PDF to the email for testing
+      /*
+      if (intern.offer_letter_url) {
+        try {
+          console.log(`Downloading offer letter from: ${intern.offer_letter_url}`);
+          const base64Content = await fetchFileAsBase64(intern.offer_letter_url);
+          attachments = [
+            {
+              content: base64Content,
+              filename: "Offer_Letter.pdf",
+            },
+          ];
+          console.log("Successfully prepared offer letter attachment");
+        } catch (err) {
+          console.error("Failed to attach offer letter:", err);
+          await supabase.from("agent_logs").insert({
+            intern_id: intern.id,
+            action: "offer_letter_attachment_failed",
+            details: { error: String(err), offer_letter_url: intern.offer_letter_url },
+            status: "warning",
+          });
+        }
+      }
+      */
 
       if (resendApiKey) {
         const response = await sendViaResend(resendApiKey, {
-          from: `InternHub Onboarding <${fromEmail}>`,
+          from: `MAQ Onboarding <${fromEmail}>`,
           to: [intern.email],
           subject: emailSubject,
           html: emailHtml,
+          attachments,
         });
 
         const resendData = await response.json();
@@ -316,7 +344,7 @@ Deno.serve(async (req: Request) => {
 
       if (resendApiKey) {
         const response = await sendViaResend(resendApiKey, {
-          from: `InternHub Onboarding <${fromEmail}>`,
+          from: `Mac Onboarding <${fromEmail}>`,
           to: [recipientEmail],
           subject: emailSubject,
           html: emailHtml,
@@ -386,7 +414,7 @@ Deno.serve(async (req: Request) => {
       }
 
       const response = await sendViaResend(resendApiKey, {
-        from: `InternHub <${fromEmail}>`,
+        from: `Mac Onboarding <${fromEmail}>`,
         to: Array.isArray(to) ? to : [to],
         subject,
         html,

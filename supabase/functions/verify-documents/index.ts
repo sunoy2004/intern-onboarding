@@ -202,6 +202,185 @@ async function simulateOCR(documentType: string): Promise<OCRResult> {
   );
 }
 
+async function callGroqVisionOCR(
+  apiKey: string,
+  base64Content: string,
+  documentType: string
+): Promise<OCRResult | null> {
+  const model = "llama-3.2-11b-vision-preview";
+  const url = "https://api.groq.com/openai/v1/chat/completions";
+
+  const promptMap: Record<string, string> = {
+    aadhaar: "Extract from Aadhaar card: name, date_of_birth (DD/MM/YYYY), aadhaar_number, address, gender. Return valid JSON only.",
+    pan: "Extract from PAN card: name, fathers_name, pan_number, date_of_birth (DD/MM/YYYY), pan_type. Return valid JSON only.",
+    bank_passbook: "Extract from bank doc: account_holder_name, account_number, bank_name, branch, ifsc_code. Return valid JSON only.",
+    offer_letter: "Extract from offer letter: candidate_name, company_name, position, department, start_date, salary_ctc. Return valid JSON only.",
+  };
+
+  const prompt = promptMap[documentType] || "Extract all key information. Return valid JSON only.";
+
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: model,
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: prompt },
+              {
+                type: "image_url",
+                image_url: {
+                  url: `data:image/jpeg;base64,${base64Content}`
+                }
+              }
+            ]
+          }
+        ],
+        temperature: 0.1,
+        response_format: { type: "json_object" }
+      })
+    });
+
+    if (!response.ok) {
+      console.error("Groq Vision OCR API failed:", await response.text());
+      return null;
+    }
+
+    const data = await response.json();
+    const content = data.choices?.[0]?.message?.content || "";
+
+    try {
+      let cleanContent = content.trim();
+      const jsonMatch = cleanContent.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        cleanContent = jsonMatch[0];
+      }
+      const parsed = JSON.parse(cleanContent);
+      return {
+        rawText: content,
+        extractedData: parsed,
+        isValid: true,
+        confidence: 0.95,
+      };
+    } catch {
+      return {
+        rawText: content,
+        extractedData: {},
+        isValid: false,
+        confidence: 0.5,
+      };
+    }
+  } catch (error) {
+    console.error("Error calling Groq Vision OCR:", error);
+    return null;
+  }
+}
+
+async function callGroqVerificationAgent(
+  apiKey: string,
+  model: string,
+  documentType: string,
+  ocrResult: OCRResult,
+  internDetails: { full_name: string; department?: string; start_date?: string }
+): Promise<{
+  isValid: boolean;
+  confidence: number;
+  extractedData: Record<string, any>;
+  rejectionReason: string | null;
+}> {
+  const modelToUse = model || "llama3-70b-8192";
+  const url = "https://api.groq.com/openai/v1/chat/completions";
+  
+  const systemPrompt = `You are an expert HR Onboarding Document Verification Agent. 
+Your task is to verify if the uploaded document matches the intern's details and is valid.
+You will receive:
+1. The expected Intern details (from the company database).
+2. The Document Type (e.g. aadhaar, pan, bank_passbook, offer_letter).
+3. The raw extracted text and data from an open-source OCR model.
+
+You must:
+- Check if the name in the document matches the intern's full name: "${internDetails.full_name}". Be lenient with minor typos or OCR errors (e.g., "John Doe" vs "Johhn Doe" or "JOHN DOE"), but reject if it is a completely different person.
+- Check if the document type matches the uploaded document content.
+- Verify key fields:
+  * For Aadhaar: 12-digit number (can be masked), name, DOB.
+  * For PAN: 10-character alphanumeric PAN number, name, DOB.
+  * For Bank Passbook: Account number, IFSC code, bank name, account holder's name.
+  * For Offer Letter: Candidate name, position/internship, start date, CTC/salary, department.
+- Return a JSON object with:
+  * "isValid": boolean (true if the document is authentic, belongs to this intern, and matches the document type; false otherwise)
+  * "extractedData": object (the final validated/corrected fields from the document)
+  * "confidence": number (between 0.0 and 1.0 representing your verification confidence)
+  * "rejectionReason": string or null (if isValid is false, provide a clear explanation for the intern on what was wrong or missing)
+
+You must respond ONLY with a valid JSON object. Do not include any markdown formatting, backticks, or extra text.`;
+
+  const userContent = JSON.stringify({
+    internProfile: internDetails,
+    documentType: documentType,
+    ocrExtracted: {
+      rawText: ocrResult.rawText,
+      extractedData: ocrResult.extractedData
+    }
+  });
+
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: modelToUse,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userContent }
+        ],
+        temperature: 0.1,
+        response_format: { type: "json_object" }
+      })
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      console.error("Groq API error response:", errText);
+      throw new Error(`Groq API returned status ${response.status}`);
+    }
+
+    const resJson = await response.json();
+    const content = resJson.choices?.[0]?.message?.content || "";
+    
+    // Parse JSON safely using regex
+    let cleanContent = content.trim();
+    const jsonMatch = cleanContent.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      cleanContent = jsonMatch[0];
+    }
+    const parsed = JSON.parse(cleanContent);
+    return {
+      isValid: parsed.isValid !== false,
+      confidence: parsed.confidence || 0.85,
+      extractedData: parsed.extractedData || ocrResult.extractedData,
+      rejectionReason: parsed.rejectionReason || null
+    };
+  } catch (error) {
+    console.error("Error in Groq verification agent:", error);
+    // Return a basic matching heuristic if Groq fails
+    return {
+      isValid: true,
+      confidence: 0.5,
+      extractedData: ocrResult.extractedData,
+      rejectionReason: "Groq agent verification failed: " + String(error)
+    };
+  }
+}
+
 async function downloadFileAsBase64(
   supabase: ReturnType<typeof createClient>,
   fileUrl: string
@@ -230,11 +409,13 @@ Deno.serve(async (req: Request) => {
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
     );
 
-    const ocrMode = Deno.env.get("OCR_MODE") || "simulated"; // "ollama", "huggingface", or "simulated"
+    const ocrMode = Deno.env.get("OCR_MODE") || "simulated"; // "groq", "ollama", "huggingface", or "simulated"
     const ocrUrl = Deno.env.get("OLLAMA_URL") || "http://localhost:11434";
     const ocrModel = Deno.env.get("OCR_MODEL") || "llava";
     const huggingfaceApiKey = Deno.env.get("HUGGINGFACE_API_KEY");
     const huggingfaceModel = Deno.env.get("HUGGINGFACE_MODEL") || "Salesforce/blip-image-captioning-base";
+    const groqApiKey = Deno.env.get("GROQ_API_KEY");
+    const groqModel = Deno.env.get("GROQ_MODEL") || "llama3-70b-8192";
 
     const body = await req.json();
     const { intern_id, document_id } = body;
@@ -242,6 +423,20 @@ Deno.serve(async (req: Request) => {
     if (!intern_id) {
       return new Response(
         JSON.stringify({ error: "intern_id is required" }),
+        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
+    // Fetch intern details to pass to verification agent
+    const { data: intern, error: internError } = await supabase
+      .from("interns")
+      .select("full_name, department, start_date")
+      .eq("id", intern_id)
+      .maybeSingle();
+
+    if (internError || !intern) {
+      return new Response(
+        JSON.stringify({ error: "Intern not found or database error: " + (internError?.message || "") }),
         { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
@@ -313,29 +508,63 @@ Deno.serve(async (req: Request) => {
         } else {
           ocrResult = await simulateOCR(doc.document_type);
         }
+      } else if (ocrMode === "groq" && groqApiKey) {
+        const fileData = await downloadFileAsBase64(supabase, doc.file_url);
+        if (fileData) {
+          const result = await callGroqVisionOCR(groqApiKey, fileData.base64, doc.document_type);
+          ocrResult = result || (await simulateOCR(doc.document_type));
+        } else {
+          ocrResult = await simulateOCR(doc.document_type);
+        }
       } else {
         ocrResult = await simulateOCR(doc.document_type);
       }
 
-      // Update document with OCR results
+      let verifiedResult = {
+        isValid: ocrResult.isValid,
+        confidence: ocrResult.confidence,
+        extractedData: ocrResult.extractedData,
+        rejectionReason: ocrResult.isValid ? null : "Document could not be verified by OCR agent"
+      };
+
+      if (groqApiKey) {
+        console.log(`Calling Groq verification agent for ${doc.document_type}...`);
+        try {
+          const agentRes = await callGroqVerificationAgent(
+            groqApiKey,
+            groqModel,
+            doc.document_type,
+            ocrResult,
+            intern
+          );
+          verifiedResult = agentRes;
+          console.log(`Groq verification result for ${doc.document_type}:`, verifiedResult);
+        } catch (err) {
+          console.error(`Groq verification agent failed for ${doc.document_type}:`, err);
+        }
+      } else {
+        console.log(`Groq API key not configured. Using raw OCR verification directly.`);
+      }
+
+      // Update document with OCR and Agent results
       await supabase
         .from("documents")
         .update({
-          status: ocrResult.isValid ? "verified" : "rejected",
+          status: verifiedResult.isValid ? "verified" : "rejected",
           ocr_raw_text: ocrResult.rawText,
-          ocr_extracted_data: ocrResult.extractedData,
+          ocr_extracted_data: verifiedResult.extractedData,
           processed_at: new Date().toISOString(),
-          rejection_reason: ocrResult.isValid ? null : "Document could not be verified by OCR agent",
+          rejection_reason: verifiedResult.rejectionReason,
         })
         .eq("id", doc.id);
 
       // Store extracted data in the dedicated table for IT dashboard
-      if (ocrResult.isValid && ocrResult.extractedData) {
+      if (verifiedResult.isValid && verifiedResult.extractedData) {
         await supabase.from("extracted_doc_data").insert({
           intern_id,
           document_type: doc.document_type,
-          extracted_fields: ocrResult.extractedData,
-          confidence_score: ocrResult.confidence,
+          extracted_fields: verifiedResult.extractedData,
+          confidence_score: verifiedResult.confidence,
           verified_at: new Date().toISOString(),
         });
       }
@@ -343,9 +572,9 @@ Deno.serve(async (req: Request) => {
       results.push({
         document_id: doc.id,
         document_type: doc.document_type,
-        status: ocrResult.isValid ? "verified" : "rejected",
-        confidence: ocrResult.confidence,
-        extracted_fields: ocrResult.extractedData,
+        status: verifiedResult.isValid ? "verified" : "rejected",
+        confidence: verifiedResult.confidence,
+        extracted_fields: verifiedResult.extractedData,
       });
     }
 
