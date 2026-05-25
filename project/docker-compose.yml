@@ -1,0 +1,191 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: onboarding_postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: onboarding_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: onboarding_redis
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  db-init:
+    image: python:3.11-slim
+    container_name: onboarding_db_init
+    environment:
+      - DATABASE_URL=postgresql://postgres:password@postgres:5432/onboarding_db
+    volumes:
+      - .:/app
+    working_dir: /app
+    command: sh -c "pip install asyncpg passlib bcrypt==4.0.1 && python packages/shared_utils/init_db.py && python packages/shared_utils/seed_db.py"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api-gateway:
+    build:
+      context: .
+      dockerfile: apps/gateway/Dockerfile
+    container_name: onboarding_gateway
+    environment:
+      - DATABASE_URL=postgresql://postgres:password@postgres:5432/onboarding_db
+      - REDIS_URL=redis://redis:6379/0
+      - VITE_SUPABASE_URL=${VITE_SUPABASE_URL}
+      - VITE_SUPABASE_ANON_KEY=${VITE_SUPABASE_ANON_KEY}
+      - JWT_SECRET_KEY=onboarding-super-secret-key-2025
+      - OCR_SERVICE_URL=http://ocr-service:8001
+      - VERIFICATION_SERVICE_URL=http://verification-service:8002
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: apps/orchestrator/Dockerfile
+    container_name: onboarding_orchestrator
+    environment:
+      - DATABASE_URL=postgresql://postgres:password@postgres:5432/onboarding_db
+      - REDIS_URL=redis://redis:6379/0
+      - OCR_SERVICE_URL=http://ocr-service:8001
+      - VERIFICATION_SERVICE_URL=http://verification-service:8002
+      - IT_SERVICE_URL=http://it-service:8005
+      - INVENTORY_SERVICE_URL=http://inventory-service:8004
+      - NOTIFICATION_SERVICE_URL=http://notification-service:8003
+      - FRONTEND_URL=${FRONTEND_URL:-http://localhost:5173}
+    volumes:
+      - .:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
+
+  ocr-service:
+    build:
+      context: services/ocr-service
+      dockerfile: Dockerfile
+    container_name: onboarding_ocr
+    environment:
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL}
+      - VISION_MODEL=${VISION_MODEL}
+    ports:
+      - "8001:8001"
+    depends_on:
+      - redis
+
+  verification-service:
+    build:
+      context: services/verification-service
+      dockerfile: Dockerfile
+    container_name: onboarding_verification
+    environment:
+      - DATABASE_URL=postgresql://postgres:password@postgres:5432/onboarding_db
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL}
+      - OPENAI_MODEL=${OPENAI_MODEL}
+    ports:
+      - "8002:8002"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  notification-service:
+    build:
+      context: services/notification-service
+      dockerfile: Dockerfile
+    container_name: onboarding_notification
+    environment:
+      - DATABASE_URL=postgresql://postgres:password@postgres:5432/onboarding_db
+      - SMTP_HOST=${SMTP_HOST}
+      - SMTP_PORT=${SMTP_PORT}
+      - SMTP_USER=${SMTP_USER}
+      - SMTP_PASSWORD=${SMTP_PASSWORD}
+      - EMAIL_FROM=${EMAIL_FROM}
+      - EMAIL_FROM_NAME=${EMAIL_FROM_NAME:-MAQ Onboarding}
+    ports:
+      - "8003:8003"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  inventory-service:
+    build:
+      context: services/inventory-service
+      dockerfile: Dockerfile
+    container_name: onboarding_inventory
+    environment:
+      - DATABASE_URL=postgresql://postgres:password@postgres:5432/onboarding_db
+    ports:
+      - "8004:8004"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  it-service:
+    build:
+      context: services/it-service
+      dockerfile: Dockerfile
+    container_name: onboarding_it
+    environment:
+      - DATABASE_URL=postgresql://postgres:password@postgres:5432/onboarding_db
+      - COMPANY_DOMAIN=${COMPANY_DOMAIN:-company.com}
+    ports:
+      - "8005:8005"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: onboarding_prometheus
+    volumes:
+      - ./infrastructure/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: onboarding_grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+
+volumes:
+  postgres_data:
+  redis_data:

@@ -1,0 +1,27 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: 'api-gateway'
+    static_configs:
+      - targets: ['api-gateway:8000']
+
+  - job_name: 'ocr-service'
+    static_configs:
+      - targets: ['ocr-service:8001']
+
+  - job_name: 'verification-service'
+    static_configs:
+      - targets: ['verification-service:8002']
+
+  - job_name: 'notification-service'
+    static_configs:
+      - targets: ['notification-service:8003']
+
+  - job_name: 'inventory-service'
+    static_configs:
+      - targets: ['inventory-service:8004']
+
+  - job_name: 'it-service'
+    static_configs:
+      - targets: ['it-service:8005']
